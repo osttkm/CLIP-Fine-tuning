@@ -12,8 +12,12 @@ Run train.py .
 MLFLOW
 ### Environment
 * python3.9
-* clip(import like below
+* clip
+
+import like below
+
 pip install ftfy
+
 pip install git+https://github.com/openai/CLIP.git
   
 
