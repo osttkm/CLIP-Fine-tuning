@@ -9,7 +9,9 @@ from tqdm import tqdm
 import argparse
 from src.my_dataloader import shoden_loader as loader
 from src.cifar_loader import cifar_loader
+from src.imagenet1k_loader import imagenet1k_loader
 import src.MlflowWriter as MW
+from src.util import *
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME,MLFLOW_USER
 # from src.eva_clip import create_eva_vit_g
 # from lavis.models import load_model
@@ -23,6 +25,7 @@ parser.add_argument('--optimizer',type=str,default='Adam')
 parser.add_argument('--scheduler',type=str,default='exponential')
 parser.add_argument('--lr',type=float,default=0.0001)
 parser.add_argument('--seed',type=int,default=9999)
+parser.add_argument('--batch_size',type=int,default=256)
 args = parser.parse_args()
 
 
@@ -82,7 +85,10 @@ class ImageCLIP(nn.Module):
 
 """学習データ，モデル定義"""
 device = torch.device('cuda')
+print('============installing CLIP============')
 model,preprocess = clip.load('ViT-B/32',device=device,jit=False) 
+print('============Finish============')
+
 clip.model.convert_weights(model)
 
 model_text = TextCLIP(model)
@@ -91,14 +97,16 @@ model_image = ImageCLIP(model)
 model_text = torch.nn.DataParallel(model_text)
 model_image = torch.nn.DataParallel(model_image)
 
-optimizer = torch.optim.Adam(model.parameters(), args.lr)
-# scheduller = torch.optim.lr_scheduler.ExponentialLR(optimizer,gamma=0.8,last_epoch=-1)
+optim = torch.optim.Adam(model.parameters(), args.lr)
+sche = torch.optim.lr_scheduler.CosineAnnealingLR(optim,T_max=100,eta_min=args.lr*0.01)
 loss_img = nn.CrossEntropyLoss()
 loss_txt = nn.CrossEntropyLoss()
 
 # train_data,test_data = loader(preprocess).run()
-loader = cifar_loader('/home/dataset/cifar10',256)
-train_data,valid,test = loader.get_loader()
+loader = imagenet1k_loader('/home/dataset/imagenet_2012/',args.batch_size)
+train_data,val = loader.get_loader()
+
+early_stopping = EarlyStopping()
 
 
 
@@ -106,34 +114,43 @@ train_data,valid,test = loader.get_loader()
 # torch.autograd.set_detect_anomaly(True)
 
 for epoch in range(10):
+    if epoch==0: print('============Start Training===========')
     model.train()
     loop = tqdm(train_data, unit='batch', desc='| Train | Epoch {:>3} |'.format(epoch+1))
     scaler = torch.cuda.amp.GradScaler()
     batch_loss = []
 
+    if epoch<10:
+        lr = create_lr(epoch)
+        optimizer = torch.optim.Adam(model.parameters(), lr)
+    else:
+        optimizer = optim
+        scheduller = sche
     for batch in loop:
         optimizer.zero_grad()
         images,text = batch
         text = clip.tokenize(text)
-        # with torch.cuda
-        image_embedding = model_image(images)
-        text_embedding = model_text(text)
+
+        with torch.cuda.amp.autocast():
+            image_embedding = model_image(images)
+            text_embedding = model_text(text)
 
 
         logit_scale = model.logit_scale.exp()
         logits_per_image, logits_per_text = create_logits(image_embedding,text_embedding,logit_scale)
         ground_truth = torch.arange(len(images)).to(device) # this one still need manually to put on GPU  
 
-        # total_loss = torch.Tensor(0,requires_grad = True)
+        
         total_loss = (loss_img(logits_per_image,ground_truth) + loss_txt(logits_per_text,ground_truth))/2
+        #　DDPのためにモデルをいじったのでlossがleaf tensor扱いにならないらしい．無理やりleaf tensorに変更
         total_loss.retain_grad()
-        total_loss.backward()
-        print(total_loss)
-        print(total_loss.grad)
-        
-        
+        # total_loss.backward()
+        scaler.scale(total_loss).backward()
+                
         convert_models_to_fp32(model)
-        optimizer.step()
+        # optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         clip.model.convert_weights(model)
 
         batch_loss.append(total_loss)
@@ -141,6 +158,33 @@ for epoch in range(10):
     train_avg_loss = torch.tensor(batch_loss).mean()
     writer.log_metric_step('contrastive_loss',train_avg_loss,epoch)
     print(f"| Train | Epoch   {epoch+1} |: contrastive_loss:{train_avg_loss:.3f}")
+
+    with torch.no_grad():
+        model.eval()
+        loop = tqdm(val, unit='batch', desc='| Train | Epoch {:>3} |'.format(epoch+1))
+        for batch in loop:
+            data,text = batch
+            batch_loss = []
+            text = clip.tokenize(text)
+
+            image_embedding = model_image(images)
+            text_embedding = model_text(text)
+
+            logit_scale = model.logit_scale.exp()
+            logits_per_image, logits_per_text = create_logits(image_embedding,text_embedding,logit_scale)
+            ground_truth = torch.arange(len(images)).to(device) # this one still need manually to put on GPU 
+        
+            total_loss = (loss_img(logits_per_image,ground_truth) + loss_txt(logits_per_text,ground_truth))/2  
+        batch_loss.append(total_loss) 
+    val_avg_loss = torch.tensor(batch_loss).mean()
+    writer.log_metric_step('contrastive_loss',val_avg_loss,epoch)
+    print(f"| Valid | Epoch   {epoch+1} |: contrastive_loss:{val_avg_loss:.3f}")
+    
+    if early_stopping.validate(val_avg_loss):
+        break
+
+
+
 print('Finished Training')
 writer.set_terminated()
         
