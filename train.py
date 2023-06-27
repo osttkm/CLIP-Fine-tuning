@@ -13,7 +13,7 @@ from src.imagenet1k_loader import imagenet1k_loader
 import src.MlflowWriter as MW
 from src.util import *
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME,MLFLOW_USER
-# from src.eva_clip import create_eva_vit_g
+from src.eva_vit import create_eva_vit_g
 # from lavis.models import load_model
 """準備"""
 
@@ -22,7 +22,8 @@ parser.add_argument('--dataset', help = 'use data',type=str,default='my_dataset'
 parser.add_argument('--model', help = 'use data',type=str,default='ViT-B/32',choices=clip.available_models())
 parser.add_argument('--epoch', type=int,default=10)
 parser.add_argument('--optimizer',type=str,default='Adam')
-parser.add_argument('--scheduler',type=str,default='exponential')
+parser.add_argument('--scheduler',type=str,default='cosine')
+parser.add_argument('--warmup_lr_times',type=float,default = 0.1)
 parser.add_argument('--lr',type=float,default=0.0001)
 parser.add_argument('--seed',type=int,default=9999)
 parser.add_argument('--batch_size',type=int,default=256)
@@ -33,7 +34,7 @@ EXPERIMENT_NAME = 'CLIP_Finetuning'
 writer = MW.MlflowWriter(EXPERIMENT_NAME)
 tags = {'trial':args.seed,
         'epoch':args.epoch,
-        MLFLOW_RUN_NAME:f'tag:{args.dataset}_{args.optimizer}_{args.seed}_{args.lr}_{args.scheduler}',
+        MLFLOW_RUN_NAME:f'tag:{args.batch_size}_{args.optimizer}_{args.seed}_{args.lr}_{args.scheduler}',
         MLFLOW_USER:args.model}
 writer.create_new_run(tags)
 writer.log_param('epoch',args.epoch)
@@ -87,6 +88,8 @@ class ImageCLIP(nn.Module):
 device = torch.device('cuda')
 print('============installing CLIP============')
 model,preprocess = clip.load('ViT-B/32',device=device,jit=False) 
+
+# import pdb;pdb.set_trace()
 print('============Finish============')
 
 clip.model.convert_weights(model)
@@ -98,7 +101,7 @@ model_text = torch.nn.DataParallel(model_text)
 model_image = torch.nn.DataParallel(model_image)
 
 optim = torch.optim.Adam(model.parameters(), args.lr)
-sche = torch.optim.lr_scheduler.CosineAnnealingLR(optim,T_max=100,eta_min=args.lr*0.01)
+sche = torch.optim.lr_scheduler.CosineAnnealingLR(optim,T_max=args.epoch,eta_min=args.lr*0.01)
 loss_img = nn.CrossEntropyLoss()
 loss_txt = nn.CrossEntropyLoss()
 
@@ -106,26 +109,28 @@ loss_txt = nn.CrossEntropyLoss()
 loader = imagenet1k_loader('/home/dataset/imagenet_2012/',args.batch_size)
 train_data,val = loader.get_loader()
 
-early_stopping = EarlyStopping()
+early_stopping = EarlyStopping(patience=10,verbose=1)
 
 
 
 """学習"""
 # torch.autograd.set_detect_anomaly(True)
 
-for epoch in range(10):
+for epoch in range(args.epoch):
     if epoch==0: print('============Start Training===========')
     model.train()
     loop = tqdm(train_data, unit='batch', desc='| Train | Epoch {:>3} |'.format(epoch+1))
     scaler = torch.cuda.amp.GradScaler()
     batch_loss = []
+    best_loss = 0
 
     if epoch<10:
-        lr = create_lr(epoch)
-        optimizer = torch.optim.Adam(model.parameters(), lr)
+        _lr = create_lr(epoch,args.lr,args.warmup_lr_times)
+        optimizer = torch.optim.Adam(model.parameters(), _lr)
     else:
         optimizer = optim
         scheduller = sche
+
     for batch in loop:
         optimizer.zero_grad()
         images,text = batch
@@ -177,11 +182,21 @@ for epoch in range(10):
             total_loss = (loss_img(logits_per_image,ground_truth) + loss_txt(logits_per_text,ground_truth))/2  
         batch_loss.append(total_loss) 
     val_avg_loss = torch.tensor(batch_loss).mean()
-    writer.log_metric_step('contrastive_loss',val_avg_loss,epoch)
+    writer.log_metric_step('val_contrastive_loss',val_avg_loss,epoch)
     print(f"| Valid | Epoch   {epoch+1} |: contrastive_loss:{val_avg_loss:.3f}")
-    
+    if epoch==0:
+        print('initial save')
+        best_loss = val_avg_loss
+        torch.save(model, f'./model_{args.batch_size}_{args.lr}_{args.epoch}.pth')
+    elif best_loss > val_avg_loss:
+        best_loss = val_avg_loss
+        print('update!!')
+        torch.save(model, f'./model_{args.batch_size}_{args.lr}_{args.epoch}.pth')
+        
     if early_stopping.validate(val_avg_loss):
+        print('============Early Stopping============')
         break
+
 
 
 

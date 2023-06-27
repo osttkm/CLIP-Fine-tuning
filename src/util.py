@@ -21,5 +21,6 @@ class EarlyStopping():
        
         return False
 
-def create_lr(epoch):
-    return 0.001 / (10 - epoch)
+def create_lr(epoch,lr,warm_up_times):
+    # return 0.1*lr*(epoch+1)
+    return lr*warm_up_times

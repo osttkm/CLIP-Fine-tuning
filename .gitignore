@@ -2,3 +2,4 @@
 /mlruns/
 /clip/
 /__pycache__/
+/model*
