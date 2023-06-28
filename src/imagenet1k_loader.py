@@ -190,8 +190,8 @@ if __name__ == '__main__':
     train_image1 = to_pil(denormalize(train_data1[0]))
     val_image1 = to_pil(denormalize(val_data1[0]))
 
-    train_image0.save('./train_image0.jpeg')
-    val_image0.save('./val_image0.jpeg')
-    train_image1.save('./train_image1.jpeg')
-    val_image1.save('./val_image1.jpeg')
+    train_image0.save('./image0.jpeg')
+    val_image0.save('./image1.jpeg')
+    train_image1.save('./image2.jpeg')
+    val_image1.save('./image3.jpeg')
     import pdb;pdb.set_trace()
